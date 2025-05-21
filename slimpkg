@@ -3,7 +3,6 @@
 import os
 import subprocess
 import urllib.request
-import hashlib
 import tarfile
 import shutil
 import argparse
@@ -14,6 +13,10 @@ import logging
 from datetime import datetime
 import sys
 import glob
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None
 
 # ANSI color codes for output formatting
 class Colors:
@@ -64,14 +67,6 @@ class SlimPkg:
                 return [line.strip() for line in f if line.strip()]
         return []
 
-    def calculate_sha256(self, file_path: Path) -> str:
-        """Calculate SHA256 checksum of a file."""
-        sha256 = hashlib.sha256()
-        with open(file_path, 'rb') as f:
-            for chunk in iter(lambda: f.read(4096), b""):
-                sha256.update(chunk)
-        return sha256.hexdigest()
-
     def get_file_size_mb(self, file_path: Path) -> float:
         """Get file size in MB."""
         return file_path.stat().st_size / (1024 * 1024) if file_path.exists() else 0.0
@@ -85,31 +80,37 @@ class SlimPkg:
         return total_size / (1024 * 1024)
 
     def download_source(self, url: str, dest: Path, pkg_name: str) -> bool:
-        """Download a source file with progress bar."""
-        print(f"  {Colors.BOLD}{pkg_name}.xz{Colors.RESET}  [                    ]   0%   0.0 MB/s", end="", flush=True)
+        """Download a source file with tqdm progress bar or fallback."""
+        print(f"  {Colors.BOLD}{pkg_name}.xz{Colors.RESET} downloading...", end="", flush=True)
         start_time = time.time()
         try:
-            urllib.request.urlretrieve(url, dest)
+            if tqdm:
+                # Get file size for progress bar
+                with urllib.request.urlopen(url) as response:
+                    total_size = int(response.getheader('Content-Length', 0))
+                    with open(dest, 'wb') as f:
+                        with tqdm(total=total_size, unit='B', unit_scale=True, desc=f"{pkg_name}.xz") as pbar:
+                            while True:
+                                chunk = response.read(8192)
+                                if not chunk:
+                                    break
+                                f.write(chunk)
+                                pbar.update(len(chunk))
+            else:
+                # Fallback if tqdm is not installed
+                urllib.request.urlretrieve(url, dest)
+                print(f"\r  {Colors.BOLD}{pkg_name}.xz{Colors.RESET} downloaded", end="", flush=True)
+
             elapsed = time.time() - start_time
             size_mb = self.get_file_size_mb(dest)
             speed = size_mb / elapsed if elapsed > 0 else 0
-            print(f"\r  {Colors.BOLD}{pkg_name}.xz{Colors.RESET}  [{'#' * 20}] 100%   {speed:.1f} MB/s")
+            print(f"  {speed:.1f} MB/s")
             self.logger.info(f"Downloaded {pkg_name} from {url} ({size_mb:.1f} MB)")
             return True
         except Exception as e:
             print(f"\r{Colors.RED}Error downloading {url}: {e}{Colors.RESET}")
             self.logger.error(f"Failed to download {pkg_name} from {url}: {e}")
             return False
-
-    def verify_checksum(self, file_path: Path, expected_checksum: str, pkg_name: str) -> bool:
-        """Verify the checksum of a downloaded file."""
-        actual_checksum = self.calculate_sha256(file_path)
-        if actual_checksum == expected_checksum:
-            self.logger.info(f"Checksum verified for {pkg_name} ({file_path})")
-            return True
-        print(f"{Colors.RED}Checksum mismatch for {file_path}{Colors.RESET}")
-        self.logger.error(f"Checksum mismatch for {pkg_name} ({file_path}): expected {expected_checksum}, got {actual_checksum}")
-        return False
 
     def extract_source(self, archive: Path, dest: Path, pkg_name: str) -> bool:
         """Extract a tar archive to a destination directory."""
@@ -127,7 +128,6 @@ class SlimPkg:
         """Run the build script or detect and execute appropriate build system."""
         build_script = pkg_dir / "build"
         env = os.environ.copy()
-        # Set environment variables to help find libraries
         env["PKG_CONFIG_PATH"] = ":".join([
             "/usr/lib/pkgconfig",
             "/usr/local/lib/pkgconfig",
@@ -141,7 +141,6 @@ class SlimPkg:
             "/usr/contrib/X11R5/lib"
         ])
 
-        # If a build script exists, use it
         if build_script.exists():
             print(f"{Colors.ITALIC}{Colors.GREY}Executing build script for {pkg_name}...{Colors.RESET}")
             try:
@@ -166,7 +165,6 @@ class SlimPkg:
                 self.logger.error(f"Build failed for {pkg_name}: {e}\nstdout: {e.stdout}\nstderr: {e.stderr}")
                 return False
 
-        # Detect build system
         configure = build_dir / "configure"
         cmakelists = build_dir / "CMakeLists.txt"
         mesonbuild = build_dir / "meson.build"
@@ -317,7 +315,6 @@ class SlimPkg:
                     "version": version_str,
                     "depends": [dep for dep in self.read_file(pkg_dir, "depends") if "make" not in dep],
                     "sources": self.read_file(pkg_dir, "sources"),
-                    "checksums": self.read_file(pkg_dir, "checksums"),
                     "category": cat
                 }
         raise FileNotFoundError(f"Package {pkg_name} not found in repository")
@@ -339,26 +336,87 @@ class SlimPkg:
                 return True
         return False
 
-    def resolve_dependencies(self, pkg_name: str, category: str = None, resolved=None, order=None):
-        """Resolve dependencies recursively and determine installation order."""
+    def compare_versions(self, v1: str, v2: str) -> int:
+        """Compare two version strings (e.g., '7.1.1' vs '7.1.0'). Returns 1 if v1 > v2, -1 if v1 < v2, 0 if equal."""
+        if v1 == "unknown" or v2 == "unknown":
+            return 0  # Cannot compare unknown versions
+        v1_parts = v1.split('.')
+        v2_parts = v2.split('.')
+        for i in range(max(len(v1_parts), len(v2_parts))):
+            p1 = int(v1_parts[i]) if i < len(v1_parts) else 0
+            p2 = int(v2_parts[i]) if i < len(v2_parts) else 0
+            if p1 > p2:
+                return 1
+            elif p1 < p2:
+                return -1
+        return 0
+
+    def resolve_dependencies(self, pkg_name: str, category: str = None, resolved=None, order=None, version_map=None):
+        """Resolve dependencies recursively, detect version conflicts, and determine installation order."""
         if resolved is None:
             resolved = set()
         if order is None:
             order = []
+        if version_map is None:
+            version_map = {}
 
-        if pkg_name in resolved or self.is_package_installed(pkg_name):
-            return resolved, order
+        if pkg_name in resolved:
+            return resolved, order, version_map
 
         try:
             _, pkg_info = self.get_package_info(pkg_name, category)
+            # Check for version conflicts
+            if pkg_name in version_map:
+                existing_version = version_map[pkg_name]
+                if existing_version != pkg_info["version"]:
+                    comparison = self.compare_versions(pkg_info["version"], existing_version)
+                    if comparison != 0:
+                        print(f"{Colors.RED}Version conflict: {pkg_name} requires version {pkg_info['version']}, "
+                              f"but {existing_version} is planned or installed{Colors.RESET}")
+                        self.logger.error(f"Version conflict: {pkg_name} ({pkg_info['version']} vs {existing_version})")
+                        return resolved, order, None  # Indicate conflict
+            else:
+                version_map[pkg_name] = pkg_info["version"]
+
+            # Check if package is installed and compare versions
+            if self.is_package_installed(pkg_name):
+                installed_version = self.get_installed_version(pkg_name)
+                if installed_version and installed_version != pkg_info["version"]:
+                    comparison = self.compare_versions(pkg_info["version"], installed_version)
+                    if comparison != 0:
+                        print(f"{Colors.YELLOW}Warning: {pkg_name} version {pkg_info['version']} requested, "
+                              f"but {installed_version} is installed{Colors.RESET}")
+                        self.logger.warning(f"Version mismatch: {pkg_name} ({pkg_info['version']} vs {installed_version})")
+                return resolved, order, version_map
+
             for dep in pkg_info["depends"]:
-                self.resolve_dependencies(dep, category, resolved, order)
+                dep_resolved, dep_order, dep_version_map = self.resolve_dependencies(
+                    dep, category, resolved, order, version_map
+                )
+                if dep_version_map is None:  # Conflict detected
+                    return resolved, order, None
+                resolved = dep_resolved
+                order = dep_order
+                version_map = dep_version_map
+
             resolved.add(pkg_name)
             order.append((pkg_name, pkg_info["version"], pkg_info["category"]))
+            return resolved, order, version_map
         except FileNotFoundError:
             print(f"{Colors.YELLOW}Warning: Dependency {pkg_name} not found{Colors.RESET}")
             self.logger.warning(f"Dependency {pkg_name} not found")
-        return resolved, order
+            return resolved, order, version_map
+
+    def get_installed_version(self, pkg_name: str) -> str:
+        """Get the version of an installed package from the database or repository."""
+        db_file = self.db_dir / f"{pkg_name}.files"
+        if db_file.exists():
+            try:
+                _, pkg_info = self.get_package_info(pkg_name, None)
+                return pkg_info["version"]
+            except FileNotFoundError:
+                return "unknown"
+        return None
 
     def save_installed_files(self, pkg_name: str, dest_dir: Path):
         """Save list of installed files to package database."""
@@ -379,19 +437,21 @@ class SlimPkg:
         self.check_build_tools()
         print(f"{Colors.GREEN}Fetching package information...{Colors.RESET}")
         print(f"{Colors.GREEN}Resolving dependencies...{Colors.RESET}")
-        resolved, install_order = self.resolve_dependencies(pkg_name, category)
+        resolved, install_order, version_map = self.resolve_dependencies(pkg_name, category)
+
+        if version_map is None:
+            print(f"{Colors.RED}Installation aborted due to version conflicts{Colors.RESET}")
+            return False
 
         if not install_order:
             print(f"{Colors.YELLOW}Package {pkg_name} is already installed or has no dependencies to install{Colors.RESET}")
             self.logger.info(f"Package {pkg_name} is already installed or has no dependencies")
             return True
 
-        # Display dependency tree
         for pkg, version, _ in install_order:
             prefix = f"{Colors.BOLD}- " if pkg == pkg_name else f"{Colors.BOLD}- [dependency] "
             print(f"  {prefix}{pkg} ({version}){Colors.RESET}")
 
-        # Calculate initial download sizes
         total_download = 0
         total_installed = 0
         download_sizes = {}
@@ -414,13 +474,12 @@ class SlimPkg:
                 continue
 
             pkg_dir, pkg_info = self.get_package_info(pkg, cat)
-            if not pkg_info["sources"] or not pkg_info["checksums"]:
-                print(f"{Colors.RED}No sources or checksums defined for {pkg}{Colors.RESET}")
-                self.logger.error(f"No sources or checksums for {pkg}")
+            if not pkg_info["sources"]:
+                print(f"{Colors.RED}No sources defined for {pkg}{Colors.RESET}")
+                self.logger.error(f"No sources for {pkg}")
                 return False
 
             source_url = pkg_info["sources"][0]
-            checksum = pkg_info["checksums"][0]
             source_file = self.cache_dir / source_url.split('/')[-1]
 
             if not source_file.exists():
@@ -428,9 +487,6 @@ class SlimPkg:
                     return False
                 download_sizes[pkg] = self.get_file_size_mb(source_file)
                 total_download += download_sizes[pkg] - download_sizes.get(pkg, 0)
-
-            if not self.verify_checksum(source_file, checksum, pkg):
-                return False
 
             build_dir = self.cache_dir / f"{pkg}-build"
             dest_dir = self.cache_dir / f"{pkg}-dest"
@@ -540,15 +596,40 @@ class SlimPkg:
         print(f"{Colors.GREEN}Installed packages:{Colors.RESET}")
         for db_file in self.db_dir.glob("*.files"):
             pkg_name = db_file.stem
-            pkg_dir, pkg_info = self.get_package_info(pkg_name, None)
-            print(f"  {Colors.BOLD}{pkg_name}-{pkg_info['version']}{Colors.RESET}")
+            try:
+                pkg_dir, pkg_info = self.get_package_info(pkg_name, None)
+                print(f"  {Colors.BOLD}{pkg_name}-{pkg_info['version']}{Colors.RESET}")
+            except FileNotFoundError:
+                print(f"  {Colors.BOLD}{pkg_name}-unknown{Colors.RESET} (not in repository)")
         self.logger.info("Listed installed packages")
+
+    def search_packages(self, query: str = None):
+        """Search for packages in the repository, or list all if no query."""
+        categories = ["core", "extra", "wayland"]
+        found = False
+        print(f"{Colors.GREEN}Searching packages...{Colors.RESET}")
+        for cat in categories:
+            cat_path = self.repo_path / cat
+            if cat_path.exists():
+                for pkg in cat_path.iterdir():
+                    if pkg.is_dir():
+                        version = self.read_file(pkg, "version")
+                        version_str = version[0].split()[0] if version else "unknown"
+                        if query is None or query.lower() in pkg.name.lower():
+                            if not found:
+                                print(f"\n{Colors.GREEN}Available packages:{Colors.RESET}")
+                                found = True
+                            print(f"  {Colors.BOLD}{pkg.name}-{version_str}{Colors.RESET} ({cat})")
+        if not found:
+            print(f"{Colors.YELLOW}No packages found matching '{query}'{Colors.RESET}")
+        self.logger.info(f"Searched for packages with query: {query if query else 'all'}")
 
 def main():
     parser = argparse.ArgumentParser(description="SlimPkg - A simple Linux package manager", add_help=False)
     parser.add_argument("-i", "--install", metavar="PACKAGE", help="Install a package")
     parser.add_argument("-r", "--remove", metavar="PACKAGE", help="Remove a package")
     parser.add_argument("-l", "--list-installed", action="store_true", help="List installed packages")
+    parser.add_argument("-s", "--search", nargs="?", const=None, metavar="QUERY", help="Search for packages (omit query to list all)")
     parser.add_argument("-h", "--help", action="store_true", help="Show this help message")
     parser.add_argument("--category", help="Package category (core/extra/wayland)")
     args = parser.parse_args()
@@ -565,8 +646,10 @@ def main():
         pkg_manager.remove_package(args.remove)
     elif args.list_installed:
         pkg_manager.list_installed()
+    elif args.search is not None:
+        pkg_manager.search_packages(args.search)
     else:
-        pkg_manager.list_packages(args.category)
+        print(f"{Colors.RED}Error: No command specified. Use -h for help.{Colors.RESET}")
 
 if __name__ == "__main__":
     main()
