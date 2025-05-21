@@ -1,0 +1,572 @@
+#!/usr/bin/env python3
+
+import os
+import subprocess
+import urllib.request
+import hashlib
+import tarfile
+import shutil
+import argparse
+from pathlib import Path
+import time
+import json
+import logging
+from datetime import datetime
+import sys
+import glob
+
+# ANSI color codes for output formatting
+class Colors:
+    BOLD = '\033[1m'
+    ITALIC = '\033[3m'
+    GREY = '\033[90m'
+    RED = '\033[91m'
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    RESET = '\033[0m'
+
+class SlimPkg:
+    def __init__(self, repo_path="/usr/src/lxpkg/repo"):
+        self.repo_path = Path(repo_path)
+        self.cache_dir = Path.home() / ".cache" / "slimpkg"
+        self.db_dir = Path("/var/lib/slimpkg")
+        self.log_file = Path("/var/log/slimpkg.log")
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.db_dir.mkdir(parents=True, exist_ok=True)
+        # Set up logging
+        logging.basicConfig(
+            filename=self.log_file,
+            level=logging.INFO,
+            format="%(asctime)s - %(levelname)s - %(message)s"
+        )
+        self.logger = logging.getLogger(__name__)
+        # Common build tools to check
+        self.build_tools = {
+            "make": shutil.which("make"),
+            "cmake": shutil.which("cmake"),
+            "ninja": shutil.which("ninja"),
+            "meson": shutil.which("meson"),
+            "python3": shutil.which("python3")
+        }
+
+    def check_build_tools(self):
+        """Check for required build tools and warn if missing."""
+        missing = [tool for tool, path in self.build_tools.items() if not path]
+        if missing:
+            print(f"{Colors.RED}Warning: Missing build tools: {', '.join(missing)}{Colors.RESET}")
+            self.logger.warning(f"Missing build tools: {', '.join(missing)}")
+
+    def read_file(self, pkg_dir: Path, filename: str) -> list[str]:
+        """Read lines from a file in the package directory."""
+        file_path = pkg_dir / filename
+        if file_path.exists():
+            with open(file_path, 'r') as f:
+                return [line.strip() for line in f if line.strip()]
+        return []
+
+    def calculate_sha256(self, file_path: Path) -> str:
+        """Calculate SHA256 checksum of a file."""
+        sha256 = hashlib.sha256()
+        with open(file_path, 'rb') as f:
+            for chunk in iter(lambda: f.read(4096), b""):
+                sha256.update(chunk)
+        return sha256.hexdigest()
+
+    def get_file_size_mb(self, file_path: Path) -> float:
+        """Get file size in MB."""
+        return file_path.stat().st_size / (1024 * 1024) if file_path.exists() else 0.0
+
+    def estimate_installed_size(self, dest_dir: Path) -> float:
+        """Estimate installed size in MB by summing file sizes in dest_dir."""
+        total_size = 0
+        for item in dest_dir.rglob('*'):
+            if item.is_file():
+                total_size += item.stat().st_size
+        return total_size / (1024 * 1024)
+
+    def download_source(self, url: str, dest: Path, pkg_name: str) -> bool:
+        """Download a source file with progress bar."""
+        print(f"  {Colors.BOLD}{pkg_name}.xz{Colors.RESET}  [                    ]   0%   0.0 MB/s", end="", flush=True)
+        start_time = time.time()
+        try:
+            urllib.request.urlretrieve(url, dest)
+            elapsed = time.time() - start_time
+            size_mb = self.get_file_size_mb(dest)
+            speed = size_mb / elapsed if elapsed > 0 else 0
+            print(f"\r  {Colors.BOLD}{pkg_name}.xz{Colors.RESET}  [{'#' * 20}] 100%   {speed:.1f} MB/s")
+            self.logger.info(f"Downloaded {pkg_name} from {url} ({size_mb:.1f} MB)")
+            return True
+        except Exception as e:
+            print(f"\r{Colors.RED}Error downloading {url}: {e}{Colors.RESET}")
+            self.logger.error(f"Failed to download {pkg_name} from {url}: {e}")
+            return False
+
+    def verify_checksum(self, file_path: Path, expected_checksum: str, pkg_name: str) -> bool:
+        """Verify the checksum of a downloaded file."""
+        actual_checksum = self.calculate_sha256(file_path)
+        if actual_checksum == expected_checksum:
+            self.logger.info(f"Checksum verified for {pkg_name} ({file_path})")
+            return True
+        print(f"{Colors.RED}Checksum mismatch for {file_path}{Colors.RESET}")
+        self.logger.error(f"Checksum mismatch for {pkg_name} ({file_path}): expected {expected_checksum}, got {actual_checksum}")
+        return False
+
+    def extract_source(self, archive: Path, dest: Path, pkg_name: str) -> bool:
+        """Extract a tar archive to a destination directory."""
+        try:
+            with tarfile.open(archive, 'r:*') as tar:
+                tar.extractall(dest)
+            self.logger.info(f"Extracted {pkg_name} to {dest}")
+            return True
+        except Exception as e:
+            print(f"{Colors.RED}Error extracting {archive}: {e}{Colors.RESET}")
+            self.logger.error(f"Failed to extract {pkg_name} ({archive}): {e}")
+            return False
+
+    def run_build_script(self, pkg_dir: Path, build_dir: Path, dest_dir: Path, pkg_name: str) -> bool:
+        """Run the build script or detect and execute appropriate build system."""
+        build_script = pkg_dir / "build"
+        env = os.environ.copy()
+        # Set environment variables to help find libraries
+        env["PKG_CONFIG_PATH"] = ":".join([
+            "/usr/lib/pkgconfig",
+            "/usr/local/lib/pkgconfig",
+            "/usr/lib/X11R5/lib/pkgconfig",
+            "/usr/contrib/X11R5/lib/pkgconfig"
+        ])
+        env["LD_LIBRARY_PATH"] = ":".join([
+            "/usr/lib",
+            "/usr/local/lib",
+            "/usr/lib/X11R5/lib",
+            "/usr/contrib/X11R5/lib"
+        ])
+
+        # If a build script exists, use it
+        if build_script.exists():
+            print(f"{Colors.ITALIC}{Colors.GREY}Executing build script for {pkg_name}...{Colors.RESET}")
+            try:
+                build_script.chmod(0o755)
+                process = subprocess.run(
+                    [build_script, str(dest_dir)],
+                    cwd=build_dir,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    env=env
+                )
+                print(f"{Colors.ITALIC}{Colors.GREY}{process.stdout}{Colors.RESET}", file=sys.stderr)
+                if process.stderr:
+                    print(f"{Colors.ITALIC}{Colors.GREY}{process.stderr}{Colors.RESET}", file=sys.stderr)
+                self.logger.info(f"Built {pkg_name} using build script in {build_dir}")
+                return True
+            except subprocess.CalledProcessError as e:
+                print(f"{Colors.RED}Build failed: {e}{Colors.RESET}")
+                print(f"{Colors.ITALIC}{Colors.GREY}{e.stdout}{Colors.RESET}", file=sys.stderr)
+                print(f"{Colors.ITALIC}{Colors.GREY}{e.stderr}{Colors.RESET}", file=sys.stderr)
+                self.logger.error(f"Build failed for {pkg_name}: {e}\nstdout: {e.stdout}\nstderr: {e.stderr}")
+                return False
+
+        # Detect build system
+        configure = build_dir / "configure"
+        cmakelists = build_dir / "CMakeLists.txt"
+        mesonbuild = build_dir / "meson.build"
+        setup_py = build_dir / "setup.py"
+
+        if configure.exists():
+            print(f"{Colors.ITALIC}{Colors.GREY}Running ./configure for {pkg_name}...{Colors.RESET}")
+            try:
+                process = subprocess.run(
+                    ["./configure", f"--prefix=/usr"],
+                    cwd=build_dir,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    env=env
+                )
+                print(f"{Colors.ITALIC}{Colors.GREY}{process.stdout}{Colors.RESET}", file=sys.stderr)
+                if process.stderr:
+                    print(f"{Colors.ITALIC}{Colors.GREY}{process.stderr}{Colors.RESET}", file=sys.stderr)
+                process = subprocess.run(
+                    ["make", f"DESTDIR={dest_dir}", "install"],
+                    cwd=build_dir,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    env=env
+                )
+                print(f"{Colors.ITALIC}{Colors.GREY}{process.stdout}{Colors.RESET}", file=sys.stderr)
+                if process.stderr:
+                    print(f"{Colors.ITALIC}{Colors.GREY}{process.stderr}{Colors.RESET}", file=sys.stderr)
+                self.logger.info(f"Built {pkg_name} using ./configure and make in {build_dir}")
+                return True
+            except subprocess.CalledProcessError as e:
+                print(f"{Colors.RED}Build failed: {e}{Colors.RESET}")
+                print(f"{Colors.ITALIC}{Colors.GREY}{e.stdout}{Colors.RESET}", file=sys.stderr)
+                print(f"{Colors.ITALIC}{Colors.GREY}{e.stderr}{Colors.RESET}", file=sys.stderr)
+                self.logger.error(f"Build failed for {pkg_name}: {e}\nstdout: {e.stdout}\nstderr: {e.stderr}")
+                return False
+
+        elif cmakelists.exists():
+            print(f"{Colors.ITALIC}{Colors.GREY}Running cmake for {pkg_name}...{Colors.RESET}")
+            build_subdir = build_dir / "build"
+            build_subdir.mkdir(exist_ok=True)
+            try:
+                process = subprocess.run(
+                    ["cmake", "..", "-DCMAKE_INSTALL_PREFIX=/usr"],
+                    cwd=build_subdir,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    env=env
+                )
+                print(f"{Colors.ITALIC}{Colors.GREY}{process.stdout}{Colors.RESET}", file=sys.stderr)
+                if process.stderr:
+                    print(f"{Colors.ITALIC}{Colors.GREY}{process.stderr}{Colors.RESET}", file=sys.stderr)
+                process = subprocess.run(
+                    ["make", f"DESTDIR={dest_dir}", "install"],
+                    cwd=build_subdir,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    env=env
+                )
+                print(f"{Colors.ITALIC}{Colors.GREY}{process.stdout}{Colors.RESET}", file=sys.stderr)
+                if process.stderr:
+                    print(f"{Colors.ITALIC}{Colors.GREY}{process.stderr}{Colors.RESET}", file=sys.stderr)
+                self.logger.info(f"Built {pkg_name} using cmake and make in {build_subdir}")
+                return True
+            except subprocess.CalledProcessError as e:
+                print(f"{Colors.RED}Build failed: {e}{Colors.RESET}")
+                print(f"{Colors.ITALIC}{Colors.GREY}{e.stdout}{Colors.RESET}", file=sys.stderr)
+                print(f"{Colors.ITALIC}{Colors.GREY}{e.stderr}{Colors.RESET}", file=sys.stderr)
+                self.logger.error(f"Build failed for {pkg_name}: {e}\nstdout: {e.stdout}\nstderr: {e.stderr}")
+                return False
+
+        elif mesonbuild.exists():
+            print(f"{Colors.ITALIC}{Colors.GREY}Running meson for {pkg_name}...{Colors.RESET}")
+            build_subdir = build_dir / "build"
+            build_subdir.mkdir(exist_ok=True)
+            try:
+                process = subprocess.run(
+                    ["meson", "setup", "build", "--prefix=/usr"],
+                    cwd=build_dir,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    env=env
+                )
+                print(f"{Colors.ITALIC}{Colors.GREY}{process.stdout}{Colors.RESET}", file=sys.stderr)
+                if process.stderr:
+                    print(f"{Colors.ITALIC}{Colors.GREY}{process.stderr}{Colors.RESET}", file=sys.stderr)
+                process = subprocess.run(
+                    ["ninja", "-C", "build", f"DESTDIR={dest_dir}", "install"],
+                    cwd=build_dir,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    env=env
+                )
+                print(f"{Colors.ITALIC}{Colors.GREY}{process.stdout}{Colors.RESET}", file=sys.stderr)
+                if process.stderr:
+                    print(f"{Colors.ITALIC}{Colors.GREY}{process.stderr}{Colors.RESET}", file=sys.stderr)
+                self.logger.info(f"Built {pkg_name} using meson and ninja in {build_subdir}")
+                return True
+            except subprocess.CalledProcessError as e:
+                print(f"{Colors.RED}Build failed: {e}{Colors.RESET}")
+                print(f"{Colors.ITALIC}{Colors.GREY}{e.stdout}{Colors.RESET}", file=sys.stderr)
+                print(f"{Colors.ITALIC}{Colors.GREY}{e.stderr}{Colors.RESET}", file=sys.stderr)
+                self.logger.error(f"Build failed for {pkg_name}: {e}\nstdout: {e.stdout}\nstderr: {e.stderr}")
+                return False
+
+        elif setup_py.exists():
+            print(f"{Colors.ITALIC}{Colors.GREY}Running Python setup.py for {pkg_name}...{Colors.RESET}")
+            try:
+                process = subprocess.run(
+                    ["python3", "setup.py", "install", f"--root={dest_dir}"],
+                    cwd=build_dir,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    env=env
+                )
+                print(f"{Colors.ITALIC}{Colors.GREY}{process.stdout}{Colors.RESET}", file=sys.stderr)
+                if process.stderr:
+                    print(f"{Colors.ITALIC}{Colors.GREY}{process.stderr}{Colors.RESET}", file=sys.stderr)
+                self.logger.info(f"Built {pkg_name} using Python setup.py in {build_dir}")
+                return True
+            except subprocess.CalledProcessError as e:
+                print(f"{Colors.RED}Build failed: {e}{Colors.RESET}")
+                print(f"{Colors.ITALIC}{Colors.GREY}{e.stdout}{Colors.RESET}", file=sys.stderr)
+                print(f"{Colors.ITALIC}{Colors.GREY}{e.stderr}{Colors.RESET}", file=sys.stderr)
+                self.logger.error(f"Build failed for {pkg_name}: {e}\nstdout: {e.stdout}\nstderr: {e.stderr}")
+                return False
+
+        print(f"{Colors.RED}No supported build system found for {pkg_name}{Colors.RESET}")
+        self.logger.error(f"No supported build system found for {pkg_name} in {build_dir}")
+        return False
+
+    def get_package_info(self, pkg_name: str, category: str = None) -> tuple[Path, dict]:
+        """Find package directory and gather its information."""
+        categories = [category] if category else ["core", "extra", "wayland"]
+        for cat in categories:
+            pkg_dir = self.repo_path / cat / pkg_name
+            if pkg_dir.exists():
+                version = self.read_file(pkg_dir, "version")
+                version_str = version[0].split()[0] if version else "unknown"
+                return pkg_dir, {
+                    "version": version_str,
+                    "depends": [dep for dep in self.read_file(pkg_dir, "depends") if "make" not in dep],
+                    "sources": self.read_file(pkg_dir, "sources"),
+                    "checksums": self.read_file(pkg_dir, "checksums"),
+                    "category": cat
+                }
+        raise FileNotFoundError(f"Package {pkg_name} not found in repository")
+
+    def is_package_installed(self, pkg_name: str) -> bool:
+        """Check if a package is installed by looking for its binary or files."""
+        db_file = self.db_dir / f"{pkg_name}.files"
+        if db_file.exists():
+            return True
+        binary_paths = [
+            Path("/usr/bin") / pkg_name,
+            Path("/usr/local/bin") / pkg_name,
+            Path("/opt") / pkg_name
+        ]
+        for path in binary_paths:
+            if path.exists():
+                self.logger.warning(f"Found {pkg_name} in {path} but not in package database")
+                print(f"{Colors.YELLOW}Warning: {pkg_name} found in {path} but not in package database{Colors.RESET}")
+                return True
+        return False
+
+    def resolve_dependencies(self, pkg_name: str, category: str = None, resolved=None, order=None):
+        """Resolve dependencies recursively and determine installation order."""
+        if resolved is None:
+            resolved = set()
+        if order is None:
+            order = []
+
+        if pkg_name in resolved or self.is_package_installed(pkg_name):
+            return resolved, order
+
+        try:
+            _, pkg_info = self.get_package_info(pkg_name, category)
+            for dep in pkg_info["depends"]:
+                self.resolve_dependencies(dep, category, resolved, order)
+            resolved.add(pkg_name)
+            order.append((pkg_name, pkg_info["version"], pkg_info["category"]))
+        except FileNotFoundError:
+            print(f"{Colors.YELLOW}Warning: Dependency {pkg_name} not found{Colors.RESET}")
+            self.logger.warning(f"Dependency {pkg_name} not found")
+        return resolved, order
+
+    def save_installed_files(self, pkg_name: str, dest_dir: Path):
+        """Save list of installed files to package database."""
+        file_list = []
+        for item in dest_dir.rglob('*'):
+            rel_path = item.relative_to(dest_dir)
+            sys_path = Path('/') / rel_path
+            if item.is_file():
+                file_list.append(str(sys_path))
+        db_file = self.db_dir / f"{pkg_name}.files"
+        with open(db_file, 'w') as f:
+            json.dump(file_list, f)
+        self.logger.info(f"Saved installed files for {pkg_name} to {db_file}")
+
+    def install_package(self, pkg_name: str, category: str = None) -> bool:
+        """Install a package and its dependencies with formatted output."""
+        self.logger.info(f"Starting installation of {pkg_name}")
+        self.check_build_tools()
+        print(f"{Colors.GREEN}Fetching package information...{Colors.RESET}")
+        print(f"{Colors.GREEN}Resolving dependencies...{Colors.RESET}")
+        resolved, install_order = self.resolve_dependencies(pkg_name, category)
+
+        if not install_order:
+            print(f"{Colors.YELLOW}Package {pkg_name} is already installed or has no dependencies to install{Colors.RESET}")
+            self.logger.info(f"Package {pkg_name} is already installed or has no dependencies")
+            return True
+
+        # Display dependency tree
+        for pkg, version, _ in install_order:
+            prefix = f"{Colors.BOLD}- " if pkg == pkg_name else f"{Colors.BOLD}- [dependency] "
+            print(f"  {prefix}{pkg} ({version}){Colors.RESET}")
+
+        # Calculate initial download sizes
+        total_download = 0
+        total_installed = 0
+        download_sizes = {}
+        for pkg, _, cat in install_order:
+            pkg_dir, pkg_info = self.get_package_info(pkg, cat)
+            source_file = self.cache_dir / pkg_info["sources"][0].split('/')[-1]
+            download_sizes[pkg] = self.get_file_size_mb(source_file)
+            total_download += download_sizes[pkg]
+
+        print(f"\n{Colors.GREEN}The following packages will be installed:{Colors.RESET}")
+        for pkg, version, _ in install_order:
+            print(f"  - {Colors.BOLD}{pkg}-{version}{Colors.RESET}")
+        print(f"\nTotal download size: {total_download:.1f} MB")
+        print("Total installed size: calculating after build...")
+
+        print(f"\n{Colors.GREEN}Downloading packages...{Colors.RESET}")
+        for pkg, _, cat in install_order:
+            if self.is_package_installed(pkg):
+                print(f"  {Colors.BOLD}{pkg}{Colors.RESET} is already installed, skipping...")
+                continue
+
+            pkg_dir, pkg_info = self.get_package_info(pkg, cat)
+            if not pkg_info["sources"] or not pkg_info["checksums"]:
+                print(f"{Colors.RED}No sources or checksums defined for {pkg}{Colors.RESET}")
+                self.logger.error(f"No sources or checksums for {pkg}")
+                return False
+
+            source_url = pkg_info["sources"][0]
+            checksum = pkg_info["checksums"][0]
+            source_file = self.cache_dir / source_url.split('/')[-1]
+
+            if not source_file.exists():
+                if not self.download_source(source_url, source_file, pkg):
+                    return False
+                download_sizes[pkg] = self.get_file_size_mb(source_file)
+                total_download += download_sizes[pkg] - download_sizes.get(pkg, 0)
+
+            if not self.verify_checksum(source_file, checksum, pkg):
+                return False
+
+            build_dir = self.cache_dir / f"{pkg}-build"
+            dest_dir = self.cache_dir / f"{pkg}-dest"
+            build_dir.mkdir(exist_ok=True)
+            dest_dir.mkdir(exist_ok=True)
+
+            if not self.extract_source(source_file, build_dir, pkg):
+                return False
+
+            src_dir = next(build_dir.iterdir(), None)
+            if not src_dir:
+                print(f"{Colors.RED}No source directory found after extraction for {pkg}{Colors.RESET}")
+                self.logger.error(f"No source directory found for {pkg} after extraction")
+                return False
+
+            print(f"{Colors.GREEN}Installing packages...{Colors.RESET}\n  Installing {Colors.BOLD}{pkg}-{pkg_info['version']}{Colors.RESET}...")
+            if not self.run_build_script(pkg_dir, src_dir, dest_dir, pkg):
+                return False
+
+            try:
+                for item in dest_dir.rglob('*'):
+                    rel_path = item.relative_to(dest_dir)
+                    sys_path = Path('/') / rel_path
+                    sys_path.parent.mkdir(parents=True, exist_ok=True)
+                    if item.is_dir():
+                        sys_path.mkdir(exist_ok=True)
+                    else:
+                        shutil.copy2(item, sys_path)
+                self.save_installed_files(pkg, dest_dir)
+                total_installed += self.estimate_installed_size(dest_dir)
+            except Exception as e:
+                print(f"{Colors.RED}Error installing {pkg} to system: {e}{Colors.RESET}")
+                self.logger.error(f"Failed to install {pkg} to system: {e}")
+                return False
+
+        print(f"\nTotal installed size: {total_installed:.1f} MB")
+        print(f"{Colors.GREEN}Cleaning up temporary files...{Colors.RESET}")
+        shutil.rmtree(self.cache_dir, ignore_errors=True)
+        self.logger.info("Cleaned up temporary files")
+        print(f"{Colors.GREEN}Updating desktop database...{Colors.RESET}")
+        subprocess.run(["update-desktop-database"], check=False)
+        print(f"{Colors.GREEN}Updating MIME database...{Colors.RESET}")
+        subprocess.run(["update-mime-database", "/usr/share/mime"], check=False)
+        print(f"{Colors.GREEN}Updating icon cache...{Colors.RESET}")
+        subprocess.run(["gtk-update-icon-cache", "-f", "/usr/share/icons/hicolor"], check=False)
+        print(f"\n{Colors.GREEN}Installation complete.{Colors.RESET}")
+        print(f"\nYou can now run `{Colors.BOLD}{pkg_name}{Colors.RESET}`")
+        self.logger.info(f"Installation of {pkg_name} completed successfully")
+        return True
+
+    def remove_package(self, pkg_name: str) -> bool:
+        """Remove a package by deleting its files."""
+        db_file = self.db_dir / f"{pkg_name}.files"
+        if not db_file.exists():
+            print(f"{Colors.RED}Package {pkg_name} is not installed{Colors.RESET}")
+            self.logger.warning(f"Attempted to remove uninstalled package {pkg_name}")
+            return False
+
+        print(f"{Colors.GREEN}Removing {Colors.BOLD}{pkg_name}{Colors.RESET}...")
+        self.logger.info(f"Removing {pkg_name}")
+        try:
+            with open(db_file, 'r') as f:
+                file_list = json.load(f)
+            for file_path in file_list:
+                path = Path(file_path)
+                if path.exists() and path.is_file():
+                    try:
+                        path.unlink()
+                    except Exception as e:
+                        print(f"{Colors.RED}Error removing {file_path}: {e}{Colors.RESET}")
+                        self.logger.error(f"Error removing {file_path}: {e}")
+            for dir_path in set(Path(f).parent for f in file_list):
+                try:
+                    dir_path.rmdir()
+                except OSError:
+                    pass
+            db_file.unlink()
+            print(f"{Colors.GREEN}Successfully removed {Colors.BOLD}{pkg_name}{Colors.RESET}")
+            self.logger.info(f"Successfully removed {pkg_name}")
+            print(f"{Colors.GREEN}Updating desktop database...{Colors.RESET}")
+            subprocess.run(["update-desktop-database"], check=False)
+            print(f"{Colors.GREEN}Updating MIME database...{Colors.RESET}")
+            subprocess.run(["update-mime-database", "/usr/share/mime"], check=False)
+            print(f"{Colors.GREEN}Updating icon cache...{Colors.RESET}")
+            subprocess.run(["gtk-update-icon-cache", "-f", "/usr/share/icons/hicolor"], check=False)
+            return True
+        except Exception as e:
+            print(f"{Colors.RED}Error removing {pkg_name}: {e}{Colors.RESET}")
+            self.logger.error(f"Error removing {pkg_name}: {e}")
+            return False
+
+    def list_packages(self, category: str = None):
+        """List available packages in the repository."""
+        categories = [category] if category else ["core", "extra", "wayland"]
+        for cat in categories:
+            cat_path = self.repo_path / cat
+            if cat_path.exists():
+                print(f"\n{Colors.GREEN}Category: {cat}{Colors.RESET}")
+                for pkg in cat_path.iterdir():
+                    if pkg.is_dir():
+                        version = self.read_file(pkg, "version")
+                        version_str = version[0].split()[0] if version else "unknown"
+                        print(f"  {Colors.BOLD}{pkg.name}-{version_str}{Colors.RESET}")
+
+    def list_installed(self):
+        """List installed packages from the package database."""
+        print(f"{Colors.GREEN}Installed packages:{Colors.RESET}")
+        for db_file in self.db_dir.glob("*.files"):
+            pkg_name = db_file.stem
+            pkg_dir, pkg_info = self.get_package_info(pkg_name, None)
+            print(f"  {Colors.BOLD}{pkg_name}-{pkg_info['version']}{Colors.RESET}")
+        self.logger.info("Listed installed packages")
+
+def main():
+    parser = argparse.ArgumentParser(description="SlimPkg - A simple Linux package manager", add_help=False)
+    parser.add_argument("-i", "--install", metavar="PACKAGE", help="Install a package")
+    parser.add_argument("-r", "--remove", metavar="PACKAGE", help="Remove a package")
+    parser.add_argument("-l", "--list-installed", action="store_true", help="List installed packages")
+    parser.add_argument("-h", "--help", action="store_true", help="Show this help message")
+    parser.add_argument("--category", help="Package category (core/extra/wayland)")
+    args = parser.parse_args()
+
+    if args.help:
+        parser.print_help()
+        return
+
+    pkg_manager = SlimPkg()
+
+    if args.install:
+        pkg_manager.install_package(args.install, args.category)
+    elif args.remove:
+        pkg_manager.remove_package(args.remove)
+    elif args.list_installed:
+        pkg_manager.list_installed()
+    else:
+        pkg_manager.list_packages(args.category)
+
+if __name__ == "__main__":
+    main()
